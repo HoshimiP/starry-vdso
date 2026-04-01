@@ -10,6 +10,6 @@ log = "0.4"
 xmas-elf = "0.9"
 rand_pcg = { version = "0.3", default-features = false }
 rand_core = { version = "0.6", default-features = false }
-kernel-elf-parser = { git = "https://github.com/Starry-OS/kernel_elf_parser.git", rev = "fdcce74" }
+kernel-elf-parser = "0.3.4"
 memory_addr = "0.4"
 cfg-if = "1.0"

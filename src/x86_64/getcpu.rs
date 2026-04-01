@@ -7,8 +7,11 @@ struct GdtDesc {
 }
 
 #[repr(align(8))]
+#[derive(Copy, Clone)]
 struct GdtBuffer(#[allow(dead_code)] [u64; 32]);
-static mut EXTENDED_GDT: GdtBuffer = GdtBuffer([0; 32]);
+
+const MAX_TRACKED_CPUS: usize = 256;
+static mut EXTENDED_GDT_POOL: [GdtBuffer; MAX_TRACKED_CPUS] = [GdtBuffer([0; 32]); MAX_TRACKED_CPUS];
 
 /// Initialize the GDT entry for vDSO getcpu.
 pub fn init_vdso_getcpu(cpu_id: u32, node_id: u32) {
@@ -27,8 +30,10 @@ pub fn init_vdso_getcpu(cpu_id: u32, node_id: u32) {
         log::warn!("GDT is too small for vDSO getcpu: limit={limit}, extending...");
 
         unsafe {
+            let cpu_idx = cpu_id as usize;
+
             let old_entries = (limit as usize + 1) / 8;
-            let new_gdt_ptr = core::ptr::addr_of_mut!(EXTENDED_GDT) as *mut u64;
+            let new_gdt_ptr = core::ptr::addr_of_mut!(EXTENDED_GDT_POOL[cpu_idx]) as *mut u64;
 
             for i in 0..old_entries {
                 *new_gdt_ptr.add(i) = *gdt_base.add(i);

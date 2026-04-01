@@ -41,6 +41,19 @@ pub fn update_vdso_data() {
     }
 }
 
+/// Initialize vDSO getcpu state for the current CPU.
+#[cfg(target_arch = "x86_64")]
+pub fn init_vdso_getcpu(cpu_id: u32, node_id: u32) {
+    use crate::x86_64;
+    x86_64::getcpu::init_vdso_getcpu(cpu_id, node_id);
+}
+
+#[cfg(target_arch = "loongarch64")]
+pub fn init_vdso_getcpu(cpu_id: u32, node_id: u32) {
+    use crate::loongarch64;
+    loongarch64::getcpu::init_vdso_getcpu(cpu_id, node_id);
+}
+
 /// Get the physical address of vDSO data for mapping to userspace
 pub fn vdso_data_paddr() -> usize {
     let data_ptr = core::ptr::addr_of!(VDSO_DATA) as usize;

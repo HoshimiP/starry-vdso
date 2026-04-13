@@ -1,5 +1,6 @@
 use crate::{
     config::ClockMode,
+    vdso_ebpf_data::VdsoEbpfData,
     vdso_time_data::VdsoTimeData,
     x86_64::{config::PVCLOCK_MAX_CPUS, pvclock_data::PvClockTimeInfo},
 };
@@ -8,6 +9,7 @@ use crate::{
 #[repr(align(4096))]
 pub struct VdsoData {
     pub time_data: VdsoTimeData,
+    pub ebpf_data: VdsoEbpfData,
     pub pvclock: [PvClockTimeInfo; PVCLOCK_MAX_CPUS],
 }
 
@@ -21,6 +23,7 @@ impl VdsoData {
     pub const fn new() -> Self {
         Self {
             time_data: VdsoTimeData::new(),
+            ebpf_data: VdsoEbpfData::new(),
             pvclock: [PvClockTimeInfo::new(); PVCLOCK_MAX_CPUS],
         }
     }

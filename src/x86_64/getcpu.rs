@@ -11,7 +11,8 @@ struct GdtDesc {
 struct GdtBuffer(#[allow(dead_code)] [u64; 32]);
 
 const MAX_TRACKED_CPUS: usize = 256;
-static mut EXTENDED_GDT_POOL: [GdtBuffer; MAX_TRACKED_CPUS] = [GdtBuffer([0; 32]); MAX_TRACKED_CPUS];
+static mut EXTENDED_GDT_POOL: [GdtBuffer; MAX_TRACKED_CPUS] =
+    [GdtBuffer([0; 32]); MAX_TRACKED_CPUS];
 
 /// Initialize the GDT entry for vDSO getcpu.
 pub fn init_vdso_getcpu(cpu_id: u32, node_id: u32) {

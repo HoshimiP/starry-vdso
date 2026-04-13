@@ -10,10 +10,22 @@ use kernel_elf_parser::{AuxEntry, AuxType};
 use log::{info, warn};
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K};
 
-/// Global vDSO data instance
-#[unsafe(link_section = ".data")]
-pub static mut VDSO_DATA: crate::vdso_data::VdsoData = crate::vdso_data::VdsoData::new();
+use crate::vdso_ebpf_data::VdsoData;
 
+#[repr(C, align(4096))]
+struct AlignedVdsoData(pub VdsoData);
+
+/// Global vDSO data instance. Keep it page-aligned so vVAR base math in kvdso
+/// always lands on the data start even after struct layout growth.
+#[unsafe(link_section = ".data")]
+static mut VDSO_DATA: AlignedVdsoData =
+    AlignedVdsoData(VdsoData::new());
+
+#[inline]
+fn vdso_data_ptr() -> *mut VdsoData {
+    unsafe { core::ptr::addr_of_mut!(VDSO_DATA.0) }
+}
+/*
 /// Initialize vDSO data
 pub fn init_vdso_data() {
     unsafe {
@@ -40,6 +52,59 @@ pub fn update_vdso_data() {
         (*data_ptr).time_update();
     }
 }
+*/
+/// Update the eBPF fast-path snapshot stored in vVAR.
+pub fn update_ebpf_data(counts: &[u32; crate::vdso_ebpf_data::MAX_SYSNO]) {
+    unsafe {
+        let data_ptr = vdso_data_ptr();
+        (*data_ptr).ebpf_data.update_counts(counts);
+        let class_hist = classify_syscalls(counts);
+        (*data_ptr)
+            .sched_hint_data
+            .update_from_class_hist(&class_hist, monotonic_time_nanos());
+    }
+}
+
+/// Update scheduler runtime hints from non-eBPF kernel paths.
+pub fn update_sched_runtime_data(
+    tid: u64,
+    task_state: u8,
+    cpu_id: u8,
+    is_idle: bool,
+) {
+    unsafe {
+        let data_ptr = vdso_data_ptr();
+        (*data_ptr).sched_hint_data.update_task_runtime(
+            monotonic_time_nanos(),
+            tid,
+            task_state,
+            cpu_id,
+            is_idle,
+        );
+    }
+}
+
+fn classify_syscalls(
+    counts: &[u32; crate::vdso_ebpf_data::MAX_SYSNO],
+) -> [u32; crate::vdso_ebpf_data::SCHED_CLASS_MAX] {
+    let mut class_hist = [0u32; crate::vdso_ebpf_data::SCHED_CLASS_MAX];
+    for (sysno, cnt) in counts.iter().enumerate() {
+        if *cnt == 0 {
+            continue;
+        }
+        let class = match sysno as u32 {
+            // read/pread/readv/recvfrom/recvmsg/epoll_wait/ppoll/select
+            63 | 67 | 65 | 207 | 212 | 22 | 73 | 23 => crate::vdso_ebpf_data::SCHED_CLASS_IO_WAIT,
+            // nanosleep/clock_nanosleep/sched_yield
+            101 | 115 | 124 => crate::vdso_ebpf_data::SCHED_CLASS_SLEEP_WAIT,
+            // futex
+            98 => crate::vdso_ebpf_data::SCHED_CLASS_SYNC_WAIT,
+            _ => crate::vdso_ebpf_data::SCHED_CLASS_OTHER,
+        };
+        class_hist[class] = class_hist[class].saturating_add(*cnt);
+    }
+    class_hist
+}
 
 /// Initialize vDSO getcpu state for the current CPU.
 #[cfg(target_arch = "x86_64")]
@@ -56,32 +121,24 @@ pub fn init_vdso_getcpu(cpu_id: u32, node_id: u32) {
 
 /// Get the physical address of vDSO data for mapping to userspace
 pub fn vdso_data_paddr() -> usize {
-    let data_ptr = core::ptr::addr_of!(VDSO_DATA) as usize;
+    let data_ptr = unsafe { core::ptr::addr_of!(VDSO_DATA.0) as usize };
     virt_to_phys(data_ptr.into()).into()
 }
 
 /// Information about loaded vDSO pages for userspace mapping and auxv update.
-pub type VdsoPageInfo = (
-    axplat::mem::PhysAddr,
-    &'static [u8],
-    usize,
-    usize,
-    Option<(usize, usize)>,
-);
+pub struct VdsoPageInfo {
+    pub vdso_paddr_page: axplat::mem::PhysAddr,
+    pub vdso_len: usize,
+    pub vdso_size: usize,
+    pub vdso_page_offset: usize,
+    pub alloc_info: Option<(usize, usize)>,
+}
 
 /// Load vDSO into the given user address space and update auxv accordingly.
 pub fn prepare_vdso_pages(vdso_kstart: usize, vdso_kend: usize) -> AxResult<VdsoPageInfo> {
     let orig_vdso_len = vdso_kend - vdso_kstart;
     let orig_page_off = vdso_kstart & (PAGE_SIZE_4K - 1);
-
-    if orig_page_off == 0 {
-        // Already page aligned: use original memory region directly.
-        let vdso_paddr_page = virt_to_phys(vdso_kstart.into());
-        let vdso_size = (vdso_kend - vdso_kstart + PAGE_SIZE_4K - 1) & !(PAGE_SIZE_4K - 1);
-        let vdso_bytes =
-            unsafe { core::slice::from_raw_parts(vdso_kstart as *const u8, orig_vdso_len) };
-        Ok((vdso_paddr_page, vdso_bytes, vdso_size, 0usize, None))
-    } else {
+   
         let total_size = orig_vdso_len + orig_page_off;
         let num_pages = total_size.div_ceil(PAGE_SIZE_4K);
         let vdso_size = num_pages * PAGE_SIZE_4K;
@@ -100,15 +157,13 @@ pub fn prepare_vdso_pages(vdso_kstart: usize, vdso_kend: usize) -> AxResult<Vdso
         unsafe { core::ptr::copy_nonoverlapping(src, dest, orig_vdso_len) };
         let alloc_vaddr = alloc_ptr as usize;
         let vdso_paddr_page = virt_to_phys(alloc_vaddr.into());
-        let vdso_bytes = unsafe { core::slice::from_raw_parts(dest as *const u8, orig_vdso_len) };
-        Ok((
+        Ok(VdsoPageInfo {
             vdso_paddr_page,
-            vdso_bytes,
+            vdso_len: orig_vdso_len,
             vdso_size,
-            orig_page_off,
-            Some((alloc_vaddr, num_pages)),
-        ))
-    }
+            vdso_page_offset: orig_page_off,
+            alloc_info: Some((alloc_vaddr, num_pages)),
+        })
 }
 
 /// Calculate ASLR-randomized vDSO user address
@@ -171,36 +226,51 @@ where
         return Err(AxError::InvalidExecutable);
     }
 
-    let (vdso_paddr_page, vdso_bytes, vdso_size, vdso_page_offset, alloc_info) =
+    let vdso_page_info =
         prepare_vdso_pages(vdso_kstart, vdso_kend).map_err(|_| AxError::InvalidExecutable)?;
 
-    let mut alloc_guard = crate::guard::VdsoAllocGuard::new(alloc_info);
+    let mut alloc_guard = crate::guard::VdsoAllocGuard::new(vdso_page_info.alloc_info);
 
     let (_base_addr, vdso_user_addr) =
-        calculate_vdso_aslr_addr(vdso_kstart, vdso_kend, vdso_page_offset);
+        calculate_vdso_aslr_addr(vdso_kstart, vdso_kend, vdso_page_info.vdso_page_offset);
 
-    match kernel_elf_parser::ELFHeadersBuilder::new(vdso_bytes).and_then(|b| {
+    let (alloc_vaddr, _alloc_pages) = vdso_page_info
+        .alloc_info
+        .ok_or(AxError::InvalidExecutable)?;
+    let vdso_buf_start = alloc_vaddr + vdso_page_info.vdso_page_offset;
+    let vdso_base_user = if vdso_page_info.vdso_page_offset == 0 {
+        vdso_user_addr
+    } else {
+        vdso_user_addr - vdso_page_info.vdso_page_offset
+    };
+    let vdso_buf = unsafe {
+        core::slice::from_raw_parts_mut(vdso_buf_start as *mut u8, vdso_page_info.vdso_len)
+    };
+
+    apply_minimal_relocations(vdso_buf, vdso_base_user)?;
+
+    match kernel_elf_parser::ELFHeadersBuilder::new(vdso_buf).and_then(|b| {
         let range = b.ph_range();
-        b.build(&vdso_bytes[range.start as usize..range.end as usize])
+        b.build(&vdso_buf[range.start as usize..range.end as usize])
     }) {
         Ok(headers) => {
             map_vdso_segments(
                 headers,
                 vdso_user_addr,
-                vdso_paddr_page,
-                vdso_page_offset,
+                vdso_page_info.vdso_paddr_page,
+                vdso_page_info.vdso_page_offset,
                 f3,
             )?;
             alloc_guard.disarm();
         }
         Err(_) => {
             info!("vDSO ELF parsing failed, using fallback mapping");
-            let map_user_start = if vdso_page_offset == 0 {
+            let map_user_start = if vdso_page_info.vdso_page_offset == 0 {
                 vdso_user_addr
             } else {
-                vdso_user_addr - vdso_page_offset
+                vdso_user_addr - vdso_page_info.vdso_page_offset
             };
-            f1(map_user_start, vdso_paddr_page, vdso_size)?;
+            f1(map_user_start, vdso_page_info.vdso_paddr_page, vdso_page_info.vdso_size)?;
             alloc_guard.disarm();
         }
     }
@@ -266,6 +336,74 @@ where
         f(seg_user_start, seg_paddr, seg_align_size, ph)?;
     }
     Ok(())
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+fn apply_minimal_relocations(_vdso_buf: &mut [u8], _vdso_base_user: usize) -> AxResult<()> {
+    Ok(())
+}
+
+#[cfg(target_arch = "riscv64")]
+fn apply_minimal_relocations(vdso_buf: &mut [u8], vdso_base_user: usize) -> AxResult<()> {
+    let elf = xmas_elf::ElfFile::new(vdso_buf).map_err(|_| AxError::InvalidExecutable)?;
+    let relocate_pairs = elf_parser::get_relocate_pairs(&elf, Some(vdso_base_user));
+    let mut patches: Vec<(usize, usize, [u8; core::mem::size_of::<usize>()])> = Vec::new();
+
+    for pair in relocate_pairs {
+        let src: usize = pair.src.into();
+        let dst: usize = pair.dst.into();
+        let count = pair.count;
+
+        if count == 0 || count > core::mem::size_of::<usize>() {
+            continue;
+        }
+
+        let rela_vaddr = dst
+            .checked_sub(vdso_base_user)
+            .ok_or(AxError::InvalidExecutable)?;
+        let target_off = vaddr_to_file_offset(&elf, rela_vaddr)?;
+        let end = target_off
+            .checked_add(count)
+            .ok_or(AxError::InvalidExecutable)?;
+
+        if end > vdso_buf.len() {
+            return Err(AxError::InvalidExecutable);
+        }
+
+        let bytes = src.to_ne_bytes();
+        patches.push((target_off, count, bytes));
+    }
+
+    for (target_off, count, bytes) in patches {
+        let end = target_off
+            .checked_add(count)
+            .ok_or(AxError::InvalidExecutable)?;
+        let out = vdso_buf
+            .get_mut(target_off..end)
+            .ok_or(AxError::InvalidExecutable)?;
+        out.copy_from_slice(&bytes[..count]);
+    }
+
+    Ok(())
+}
+
+#[cfg(target_arch = "riscv64")]
+fn vaddr_to_file_offset(elf: &xmas_elf::ElfFile<'_>, vaddr: usize) -> AxResult<usize> {
+    for ph in elf
+        .program_iter()
+        .filter(|ph| ph.get_type() == Ok(xmas_elf::program::Type::Load))
+    {
+        let p_offset = ph.offset() as usize;
+        let p_vaddr = ph.virtual_addr() as usize;
+        let p_filesz = ph.file_size() as usize;
+
+        if vaddr >= p_vaddr && vaddr < p_vaddr + p_filesz {
+            return p_offset
+                .checked_add(vaddr - p_vaddr)
+                .ok_or(AxError::InvalidExecutable);
+        }
+    }
+    Err(AxError::InvalidExecutable)
 }
 
 #[cfg(not(target_arch = "x86_64"))]

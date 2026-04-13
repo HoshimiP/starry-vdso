@@ -2,6 +2,7 @@
 pub mod embed;
 pub mod guard;
 pub mod vdso;
+pub mod vdso_ebpf_data;
 mod vdso_time_data;
 
 cfg_if::cfg_if! {
